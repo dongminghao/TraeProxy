@@ -7,7 +7,7 @@ from typing import Dict, Optional
 # -------------------------- 核心配置（可根据需求调整）--------------------------
 # 1. NVIDIA 大模型 API 配置（参考官方文档，需替换为你的 NVIDIA API Key）
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_API_KEY = "你自己的 API KEY "  # 从 NVIDIA NGC 平台获取
+NVIDIA_API_KEY = "$API_KEY_REQUIRED_IF_EXECUTING_OUTSIDE_NGC"  # 从 NVIDIA NGC 平台获取
 
 # 2. 代理服务配置（Trae IDE 连接时需使用以下信息）
 PROXY_API_KEY = "sk-nvidia-trae-proxy-87654321-ABCD-EFGH-IJKL-1234567890AB"  # 自定义API密钥（Trae中需填入）
@@ -52,7 +52,7 @@ MODEL_CONFIGS: Dict[str, Dict] = {
         "stream": True
     },
     # 模型4：DeepSeek V3.1
-    "deepseek/deepseek-v3.1": {
+    "deepseek-ai/deepseek-v3.1": {
         "nvidia_model_id": "deepseek-ai/deepseek-v3.1",
         "temperature": 0.2,
         "top_p": 0.7,
