@@ -117,7 +117,7 @@ MAX_WORKERS = get_env_int("TRAE_PROXY_MAX_WORKERS", 20)        # 处理NVIDIA请
 MAX_RETRY_COUNT = get_env_int("TRAE_PROXY_MAX_RETRY", 3)       # 请求失败最大重试次数
 SHUTDOWN_TIMEOUT = get_env_int("TRAE_PROXY_SHUTDOWN_TIMEOUT", 30)  # 关闭超时时间(秒)
 REQUEST_TIMEOUT = get_env_int("TRAE_PROXY_REQUEST_TIMEOUT", 300)  # 请求超时时间（秒）
-STREAM_MAX_TIMEOUT = get_env_int("TRAE_PROXY_STREAM_MAX_TIMEOUT", 30) # 流式响应最大超时时间（秒）
+STREAM_MAX_TIMEOUT = get_env_int("TRAE_PROXY_STREAM_MAX_TIMEOUT", 60) # 流式响应最大超时时间（秒）
 
 # 移除配置日志记录以提高性能
 
@@ -147,6 +147,10 @@ def process_nvidia_request(request_data: Dict, response_queue: queue.Queue, done
     response_id = request_data["response_id"]
     proxy_model_id = request_data["proxy_model_id"]
     messages = request_data["messages"]
+    
+    # 添加请求状态监控
+    request_start_time = time.time()
+    response_queue.put({"status": "started", "timestamp": request_start_time, "model": proxy_model_id})
     
     # 使用get方法避免异常处理开销
     model_config = MODEL_CONFIGS.get(proxy_model_id)
@@ -190,6 +194,10 @@ def process_nvidia_request(request_data: Dict, response_queue: queue.Queue, done
             done_event.set()
             return
             
+        # 在请求处理过程中定期发送状态更新
+        if time.time() - request_start_time > 30:  # 每30秒发送一次状态更新
+            response_queue.put({"status": "processing", "elapsed": time.time() - request_start_time, "model": proxy_model_id})
+            
         try:
             nvidia_response = requests.post(
                 url=f"{NVIDIA_BASE_URL}/chat/completions",
@@ -213,10 +221,15 @@ def process_nvidia_request(request_data: Dict, response_queue: queue.Queue, done
                     except:
                         pass
                 
-                # 对于服务器错误(5xx)进行重试
-                if nvidia_response.status_code >= 500 and retry_count < MAX_RETRY_COUNT - 1:
+                # 对更多错误类型进行重试，包括特定于deepseek模型的错误
+                if ((nvidia_response.status_code >= 500 or 
+                    nvidia_response.status_code == 429 or  # 请求过多
+                    (nvidia_response.status_code >= 400 and "deepseek" in proxy_model_id.lower())) and  # 对deepseek模型的客户端错误也重试
+                    retry_count < MAX_RETRY_COUNT - 1):
                     retry_count += 1
-                    time.sleep(1 * retry_count)  # 线性退避
+                    # 使用指数退避
+                    backoff_time = min(2 ** retry_count, 10)  # 指数退避，最大10秒
+                    time.sleep(backoff_time)
                     continue
                 
                 response_queue.put({"error": error_message, "code": error_code})
@@ -224,13 +237,37 @@ def process_nvidia_request(request_data: Dict, response_queue: queue.Queue, done
                 done_event.set()
                 return
             
-            # 处理流式响应 - 优化数据处理路径
+            # 处理流式响应 - 优化数据处理路径，添加流量控制
+            line_count = 0
             for line in nvidia_response.iter_lines(decode_unicode=True):
                 if shutdown_event.is_set():
                     break
                     
                 if line and line.startswith("data: "):
-                    response_queue.put(line)
+                    # 实现流量控制：每处理10行数据，检查队列大小
+                    line_count += 1
+                    if line_count % 10 == 0:
+                        # 检查队列大小，如果队列过大则暂停处理
+                        try:
+                            queue_size = response_queue.qsize()
+                            if queue_size > 50:  # 如果队列中有超过50个项目
+                                time.sleep(0.1)  # 暂停0.1秒，让消费者处理队列中的数据
+                        except:
+                            # 如果无法获取队列大小，继续处理
+                            pass
+                    
+                    # 使用非阻塞方式放入队列，避免阻塞
+                    try:
+                        response_queue.put(line, block=False)
+                    except queue.Full:
+                        # 如果队列已满，等待一小段时间后重试
+                        time.sleep(0.05)
+                        try:
+                            response_queue.put(line, block=False)
+                        except queue.Full:
+                            # 如果仍然失败，记录错误并继续
+                            # 在实际应用中，这里可以添加日志记录
+                            pass
             
             # 流结束后放入None作为标志
             response_queue.put(None)
@@ -240,7 +277,9 @@ def process_nvidia_request(request_data: Dict, response_queue: queue.Queue, done
         except requests.exceptions.Timeout:
             retry_count += 1
             if retry_count < MAX_RETRY_COUNT:
-                time.sleep(1 * retry_count)  # 线性退避
+                # 使用指数退避
+                backoff_time = min(2 ** retry_count, 10)  # 指数退避，最大10秒
+                time.sleep(backoff_time)
                 continue
             response_queue.put({"error": f"NVIDIA API request timed out after {REQUEST_TIMEOUT} seconds", "code": "nvidia_api_timeout"})
             response_queue.put(None)
@@ -249,15 +288,36 @@ def process_nvidia_request(request_data: Dict, response_queue: queue.Queue, done
         except requests.exceptions.ConnectionError:
             retry_count += 1
             if retry_count < MAX_RETRY_COUNT:
-                time.sleep(1 * retry_count)  # 线性退避
+                # 使用指数退避
+                backoff_time = min(2 ** retry_count, 10)  # 指数退避，最大10秒
+                time.sleep(backoff_time)
                 continue
             response_queue.put({"error": "Connection error when connecting to NVIDIA API", "code": "nvidia_api_connection_error"})
             response_queue.put(None)
             break
             
+        except requests.exceptions.RequestException as e:
+            # 处理请求相关的异常
+            retry_count += 1
+            if retry_count < MAX_RETRY_COUNT:
+                # 使用指数退避
+                backoff_time = min(2 ** retry_count, 10)  # 指数退避，最大10秒
+                time.sleep(backoff_time)
+                continue
+            response_queue.put({"error": f"Request error: {str(e)}", "code": "request_error"})
+            response_queue.put(None)
+            break
+            
+        except json.JSONDecodeError as e:
+            # 处理JSON解析错误
+            response_queue.put({"error": f"JSON decode error: {str(e)}", "code": "json_decode_error"})
+            response_queue.put(None)
+            break
+            
         except Exception as e:
-            # 简化异常处理
-            response_queue.put({"error": f"NVIDIA API request failed: {str(e)}", "code": "nvidia_api_error"})
+            # 处理其他异常，添加模型特定信息
+            error_info = f"NVIDIA API request failed for model {proxy_model_id}: {str(e)}"
+            response_queue.put({"error": error_info, "code": "nvidia_api_error"})
             response_queue.put(None)
             break
     
@@ -426,10 +486,12 @@ def stream_generator(response_id: str, proxy_model_id: str) -> Generator[str, No
         response_queue = response_queues.get(response_id)
     
     if not response_queue:
-        # 队列可能还未创建，稍作等待
+        # 队列可能还未创建，稍作等待，特别是对于deepseek模型
         with response_events_lock:
             if response_id in response_events:
-                response_events[response_id].wait(timeout=5)
+                # 增加等待时间，特别是对于deepseek模型
+                wait_timeout = 10 if "deepseek" in proxy_model_id.lower() else 5
+                response_events[response_id].wait(timeout=wait_timeout)
         
         # 再次尝试获取队列（线程安全）
         with response_queues_lock:
@@ -444,16 +506,31 @@ def stream_generator(response_id: str, proxy_model_id: str) -> Generator[str, No
 
     while not shutdown_event.is_set():
         try:
-            # 使用超时获取，以便定期检查shutdown_event
+            # 使用更长的超时时间获取，避免大流量输出时频繁超时
             try:
-                line = response_queue.get(timeout=0.5)
+                line = response_queue.get(timeout=3.0)  # 增加到3秒超时
             except queue.Empty:
-                # 检查总时间是否超过30秒（防止无限等待）
-                if time.time() - start_time > STREAM_MAX_TIMEOUT:
-                    error_chunk = {"id": response_id, "choices": [{"delta": {"content": "\n\nError: Maximum streaming time exceeded."}}]}
+                # 检查总时间是否超过最大超时时间（防止无限等待）
+                # 为deepseek模型使用更长的超时时间
+                model_timeout = STREAM_MAX_TIMEOUT
+                if "deepseek" in proxy_model_id.lower():
+                    model_timeout = STREAM_MAX_TIMEOUT * 1.5  # deepseek模型使用1.5倍超时时间
+                
+                if time.time() - start_time > model_timeout:
+                    error_chunk = {"id": response_id, "choices": [{"delta": {"content": f"\n\nError: Maximum streaming time ({model_timeout}s) exceeded."}}]}
                     yield f"data: {json.dumps(error_chunk)}\n\n"
                     finish_reason = "timeout"
                     break
+                
+                # 添加队列状态检查，区分临时空队列和真正超时
+                empty_count = getattr(stream_generator, 'empty_count', 0) + 1
+                setattr(stream_generator, 'empty_count', empty_count)
+                
+                # 如果连续5次队列为空，发送一个状态更新
+                if empty_count % 5 == 0:
+                    status_chunk = {"id": response_id, "choices": [{"delta": {"content": f"\n\nStatus: Processing large response, please wait..."}}]}
+                    yield f"data: {json.dumps(status_chunk)}\n\n"
+                
                 continue
                 
             if line is None:
@@ -466,6 +543,11 @@ def stream_generator(response_id: str, proxy_model_id: str) -> Generator[str, No
                 yield f"data: {json.dumps(error_chunk)}\n\n"
                 finish_reason = "error"
                 break
+            
+            # 处理状态更新信息
+            if isinstance(line, dict) and "status" in line:
+                # 状态更新信息，不传递给客户端，仅用于内部监控
+                continue
 
             if not line.startswith("data: "):
                 continue
@@ -482,10 +564,30 @@ def stream_generator(response_id: str, proxy_model_id: str) -> Generator[str, No
                     chunk_data["model"] = proxy_model_id
                     chunk_data["choices"][0]["delta"].pop("role", None)
                     yield f"data: {json.dumps(chunk_data)}\n\n"
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as json_error:
+                # 增强JSON解析错误处理，记录错误内容但不中断流
+                # 在实际应用中，这里可以添加日志记录
+                continue
+            except Exception as chunk_error:
+                # 处理其他数据块处理错误
+                # 在实际应用中，这里可以添加日志记录
                 continue
         except Exception as e:
-            error_chunk = {"id": response_id, "choices": [{"delta": {"content": f"\n\nError: Stream processing error: {str(e)}"}}]}
+            # 增强异常处理，提供更详细的错误信息
+            error_type = type(e).__name__
+            error_detail = str(e)
+            
+            # 根据错误类型提供更具体的错误信息
+            if "queue" in error_type.lower() or "Queue" in error_type:
+                error_message = f"\n\nError: Queue operation failed ({error_type}): {error_detail}"
+            elif "timeout" in error_type.lower() or "Timeout" in error_type:
+                error_message = f"\n\nError: Operation timed out ({error_type}): {error_detail}"
+            elif "connection" in error_type.lower() or "Connection" in error_type:
+                error_message = f"\n\nError: Connection issue ({error_type}): {error_detail}"
+            else:
+                error_message = f"\n\nError: Stream processing failed ({error_type}): {error_detail}"
+            
+            error_chunk = {"id": response_id, "choices": [{"delta": {"content": error_message}}]}
             yield f"data: {json.dumps(error_chunk)}\n\n"
             finish_reason = "error"
             break
