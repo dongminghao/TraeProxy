@@ -101,6 +101,20 @@ MODEL_CONFIGS: Dict[str, Dict] = {
     }   
 }
 
+# 模型特定配置 - 支持从环境变量配置不同模型的超时参数
+# 格式: TRAE_PROXY_MODEL_TIMEOUT_<model_name>=timeout_seconds
+# 例如: TRAE_PROXY_MODEL_TIMEOUT_deepseek=90
+def get_model_timeout(model_id: str, default_timeout: int) -> int:
+    """获取特定模型的超时配置"""
+    try:
+        # 从模型ID中提取模型名称（去除路径前缀）
+        model_name = model_id.split("/")[-1].lower()
+        env_var_name = f"TRAE_PROXY_MODEL_TIMEOUT_{model_name}"
+        timeout = get_env_int(env_var_name, default_timeout)
+        return timeout
+    except:
+        return default_timeout
+
 # -------------------------- 双线程双缓冲配置 --------------------------
 # 支持从环境变量动态配置
 def get_env_int(name: str, default: int) -> int:
@@ -221,11 +235,11 @@ def process_nvidia_request(request_data: Dict, response_queue: queue.Queue, done
                     except:
                         pass
                 
-                # 对更多错误类型进行重试，包括特定于deepseek模型的错误
-                if ((nvidia_response.status_code >= 500 or 
-                    nvidia_response.status_code == 429 or  # 请求过多
-                    (nvidia_response.status_code >= 400 and "deepseek" in proxy_model_id.lower())) and  # 对deepseek模型的客户端错误也重试
-                    retry_count < MAX_RETRY_COUNT - 1):
+                # 对可恢复错误进行重试，避免对客户端错误无条件重试
+                retryable_errors = {429, 500, 502, 503, 504}  # 可重试的HTTP状态码
+                if (nvidia_response.status_code in retryable_errors or 
+                    (nvidia_response.status_code == 400 and "deepseek" in proxy_model_id.lower() and "rate_limit" in error_message.lower())) and  # 仅对deepseek的速率限制错误重试
+                    retry_count < MAX_RETRY_COUNT - 1:
                     retry_count += 1
                     # 使用指数退避
                     backoff_time = min(2 ** retry_count, 10)  # 指数退避，最大10秒
@@ -244,17 +258,23 @@ def process_nvidia_request(request_data: Dict, response_queue: queue.Queue, done
                     break
                     
                 if line and line.startswith("data: "):
-                    # 实现流量控制：每处理10行数据，检查队列大小
+                    # 实现流量控制：每处理10行数据，检查队列状态
                     line_count += 1
                     if line_count % 10 == 0:
-                        # 检查队列大小，如果队列过大则暂停处理
+                        # 使用线程安全的方式检查队列状态，避免使用非线程安全的qsize()
                         try:
-                            queue_size = response_queue.qsize()
-                            if queue_size > 50:  # 如果队列中有超过50个项目
-                                time.sleep(0.1)  # 暂停0.1秒，让消费者处理队列中的数据
-                        except:
-                            # 如果无法获取队列大小，继续处理
-                            pass
+                            # 使用非阻塞方式尝试放入队列，如果失败说明队列可能已满
+                            test_item = "queue_test"
+                            response_queue.put(test_item, block=False)
+                            # 如果成功，立即移除测试项
+                            try:
+                                # 尝试获取刚放入的测试项
+                                response_queue.get_nowait()
+                            except queue.Empty:
+                                pass
+                        except queue.Full:
+                            # 如果队列已满，暂停处理让消费者处理队列中的数据
+                            time.sleep(0.1)
                     
                     # 使用非阻塞方式放入队列，避免阻塞
                     try:
@@ -486,11 +506,11 @@ def stream_generator(response_id: str, proxy_model_id: str) -> Generator[str, No
         response_queue = response_queues.get(response_id)
     
     if not response_queue:
-        # 队列可能还未创建，稍作等待，特别是对于deepseek模型
+        # 队列可能还未创建，稍作等待，特别是对于需要较长处理时间的模型
         with response_events_lock:
             if response_id in response_events:
-                # 增加等待时间，特别是对于deepseek模型
-                wait_timeout = 10 if "deepseek" in proxy_model_id.lower() else 5
+                # 使用可配置的模型等待时间
+                wait_timeout = get_model_timeout(proxy_model_id, 5) // 12  # 默认5秒，按比例调整
                 response_events[response_id].wait(timeout=wait_timeout)
         
         # 再次尝试获取队列（线程安全）
@@ -511,10 +531,8 @@ def stream_generator(response_id: str, proxy_model_id: str) -> Generator[str, No
                 line = response_queue.get(timeout=3.0)  # 增加到3秒超时
             except queue.Empty:
                 # 检查总时间是否超过最大超时时间（防止无限等待）
-                # 为deepseek模型使用更长的超时时间
-                model_timeout = STREAM_MAX_TIMEOUT
-                if "deepseek" in proxy_model_id.lower():
-                    model_timeout = STREAM_MAX_TIMEOUT * 1.5  # deepseek模型使用1.5倍超时时间
+                # 使用可配置的模型超时参数
+                model_timeout = get_model_timeout(proxy_model_id, STREAM_MAX_TIMEOUT)
                 
                 if time.time() - start_time > model_timeout:
                     error_chunk = {"id": response_id, "choices": [{"delta": {"content": f"\n\nError: Maximum streaming time ({model_timeout}s) exceeded."}}]}
