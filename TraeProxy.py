@@ -2,13 +2,18 @@ from flask import Flask, request, Response, jsonify
 import requests
 import json
 import uuid
-from typing import Dict, Optional
+import threading
+import queue
+import concurrent.futures
+import atexit
+import os
+import time
+from typing import Dict, Optional, Generator, Any, Tuple
 
 # -------------------------- 核心配置（可根据需求调整）--------------------------
 # 1. NVIDIA 大模型 API 配置（参考官方文档，需替换为你的 NVIDIA API Key）
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_API_KEY = "$API_KEY_REQUIRED_IF_EXECUTING_OUTSIDE_NGC"  # 从 NVIDIA NGC 平台获取
-
+NVIDIA_API_KEY = "$API_KEY_REQUIRED_IF_EXECUTING_OUTSIDE_NGC"  # 填入你自己的APIKEY,从 NVIDIA NGC 平台获取
 # 2. 代理服务配置（Trae IDE 连接时需使用以下信息）
 PROXY_API_KEY = "sk-nvidia-trae-proxy-87654321-ABCD-EFGH-IJKL-1234567890AB"  # 自定义API密钥（Trae中需填入）
 PROXY_HOST = "0.0.0.0"  # 允许外部访问（本地部署填127.0.0.1）
@@ -96,8 +101,205 @@ MODEL_CONFIGS: Dict[str, Dict] = {
     }   
 }
 
+# -------------------------- 双线程双缓冲配置 --------------------------
+# 支持从环境变量动态配置
+def get_env_int(name: str, default: int) -> int:
+    """从环境变量获取整数值，如果不存在或无效则使用默认值"""
+    try:
+        value = os.environ.get(name)
+        return int(value) if value is not None else default
+    except (ValueError, TypeError):
+        logger.warning(f"无效的环境变量 {name}，使用默认值: {default}")
+        return default
+
+MAX_QUEUE_SIZE = get_env_int("TRAE_PROXY_MAX_QUEUE_SIZE", 100)  # 请求队列最大容量
+MAX_WORKERS = get_env_int("TRAE_PROXY_MAX_WORKERS", 20)        # 处理NVIDIA请求的线程池最大数量
+MAX_RETRY_COUNT = get_env_int("TRAE_PROXY_MAX_RETRY", 3)       # 请求失败最大重试次数
+SHUTDOWN_TIMEOUT = get_env_int("TRAE_PROXY_SHUTDOWN_TIMEOUT", 30)  # 关闭超时时间(秒)
+REQUEST_TIMEOUT = get_env_int("TRAE_PROXY_REQUEST_TIMEOUT", 300)  # 请求超时时间（秒）
+STREAM_MAX_TIMEOUT = get_env_int("TRAE_PROXY_STREAM_MAX_TIMEOUT", 30) # 流式响应最大超时时间（秒）
+
+# 移除配置日志记录以提高性能
+
+# 请求队列
+request_queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
+
+# 线程安全的共享资源
+response_queues_lock = threading.Lock()  # 保护response_queues字典的锁
+response_events_lock = threading.Lock()  # 保护response_events字典的锁
+response_queues: Dict[str, queue.Queue] = {}
+response_events: Dict[str, threading.Event] = {}  # 用于通知响应生成器NVIDIA请求已完成
+
+# 线程池
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+# 优雅关闭控制
+shutdown_event = threading.Event()  # 用于通知所有线程关闭
+
 # -------------------------- 代理服务实现 --------------------------
 app = Flask(__name__)
+
+def process_nvidia_request(request_data: Dict, response_queue: queue.Queue, done_event: threading.Event):
+    """
+    在独立线程中处理单个NVIDIA API请求，并将结果放入响应队列。
+    优化锁使用和性能关键路径。
+    """
+    response_id = request_data["response_id"]
+    proxy_model_id = request_data["proxy_model_id"]
+    messages = request_data["messages"]
+    
+    # 使用get方法避免异常处理开销
+    model_config = MODEL_CONFIGS.get(proxy_model_id)
+    if not model_config:
+        response_queue.put({"error": f"Model {proxy_model_id} configuration not found", "code": "model_not_found"})
+        response_queue.put(None)
+        done_event.set()
+        return
+
+    # 构造发给NVIDIA的请求参数 - 使用更高效的字典构建方式
+    nvidia_payload = {
+        "model": model_config["nvidia_model_id"],
+        "messages": messages.copy(),  # 创建副本避免修改原始数据
+        "temperature": model_config["temperature"],
+        "top_p": model_config["top_p"],
+        "max_tokens": model_config["max_tokens"],
+        "stream": model_config["stream"]
+    }
+    
+    # 使用字典推导式合并可选参数，减少条件判断
+    optional_params = {k: model_config[k] for k in ["frequency_penalty", "presence_penalty"] if k in model_config}
+    nvidia_payload.update(optional_params)
+    
+    if "extra_body" in model_config:
+        nvidia_payload.update(model_config["extra_body"])
+    if "system_content" in model_config:
+        nvidia_payload["messages"].insert(0, {"role": "system", "content": model_config["system_content"]})
+
+    # 发送请求至NVIDIA API，添加重试机制
+    nvidia_headers = {
+        "Authorization": f"Bearer {NVIDIA_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    retry_count = 0
+    while retry_count < MAX_RETRY_COUNT:
+        # 快速检查关闭信号
+        if shutdown_event.is_set():
+            response_queue.put({"error": "Server shutting down", "code": "server_shutdown"})
+            response_queue.put(None)
+            done_event.set()
+            return
+            
+        try:
+            nvidia_response = requests.post(
+                url=f"{NVIDIA_BASE_URL}/chat/completions",
+                json=nvidia_payload,
+                headers=nvidia_headers,
+                stream=True,
+                timeout=REQUEST_TIMEOUT
+            )
+            
+            # 检查HTTP错误 - 优化错误处理路径
+            if nvidia_response.status_code >= 400:
+                error_code = f"nvidia_api_error_{nvidia_response.status_code}"
+                error_message = f"NVIDIA API returned error: {nvidia_response.status_code}"
+                
+                # 只在客户端错误时尝试解析JSON
+                if nvidia_response.status_code < 500:
+                    try:
+                        error_json = nvidia_response.json()
+                        if "error" in error_json:
+                            error_message = f"NVIDIA API error: {error_json['error'].get('message', 'Unknown error')}"
+                    except:
+                        pass
+                
+                # 对于服务器错误(5xx)进行重试
+                if nvidia_response.status_code >= 500 and retry_count < MAX_RETRY_COUNT - 1:
+                    retry_count += 1
+                    time.sleep(1 * retry_count)  # 线性退避
+                    continue
+                
+                response_queue.put({"error": error_message, "code": error_code})
+                response_queue.put(None)
+                done_event.set()
+                return
+            
+            # 处理流式响应 - 优化数据处理路径
+            for line in nvidia_response.iter_lines(decode_unicode=True):
+                if shutdown_event.is_set():
+                    break
+                    
+                if line and line.startswith("data: "):
+                    response_queue.put(line)
+            
+            # 流结束后放入None作为标志
+            response_queue.put(None)
+            done_event.set()
+            return  # 成功完成，直接返回
+            
+        except requests.exceptions.Timeout:
+            retry_count += 1
+            if retry_count < MAX_RETRY_COUNT:
+                time.sleep(1 * retry_count)  # 线性退避
+                continue
+            response_queue.put({"error": f"NVIDIA API request timed out after {REQUEST_TIMEOUT} seconds", "code": "nvidia_api_timeout"})
+            response_queue.put(None)
+            break
+            
+        except requests.exceptions.ConnectionError:
+            retry_count += 1
+            if retry_count < MAX_RETRY_COUNT:
+                time.sleep(1 * retry_count)  # 线性退避
+                continue
+            response_queue.put({"error": "Connection error when connecting to NVIDIA API", "code": "nvidia_api_connection_error"})
+            response_queue.put(None)
+            break
+            
+        except Exception as e:
+            # 简化异常处理
+            response_queue.put({"error": f"NVIDIA API request failed: {str(e)}", "code": "nvidia_api_error"})
+            response_queue.put(None)
+            break
+    
+    # 确保事件被设置
+    done_event.set()
+
+def request_processor():
+    """
+    请求处理线程：从请求队列中获取任务，并提交到线程池执行。
+    保留线程安全保护和优雅关闭支持，但移除日志记录以提高性能。
+    """
+    while not shutdown_event.is_set():
+        try:
+            # 使用超时获取，以便定期检查关闭信号
+            request_data = request_queue.get(timeout=1.0)
+            
+            if request_data is None:  # 终止信号
+                break
+            
+            response_id = request_data["response_id"]
+            
+            # 线程安全地添加队列和事件
+            with response_queues_lock:
+                response_queues[response_id] = queue.Queue()
+            
+            with response_events_lock:
+                response_events[response_id] = threading.Event()
+            
+            # 提交任务到线程池
+            executor.submit(
+                process_nvidia_request, 
+                request_data, 
+                response_queues[response_id], 
+                response_events[response_id]
+            )
+            
+        except queue.Empty:
+            # 超时，继续循环并检查关闭信号
+            continue
+        except Exception:
+            # 继续处理其他请求
+            continue
 
 def validate_api_key() -> bool:
     """验证请求中的API密钥是否匹配代理配置"""
@@ -137,154 +339,200 @@ def chat_completions():
     Trae IDE 核心接口：转发聊天请求至NVIDIA大模型
     处理流式响应，并适配Trae要求的格式
     """
+    # 检查服务是否正在关闭
+    if shutdown_event.is_set():
+        return jsonify({"error": "Service is shutting down", "code": "service_unavailable"}), 503
+        
     # 1. 验证API密钥
     if not validate_api_key():
-        return jsonify({"error": "Invalid API Key"}), 401
+        return jsonify({"error": "Invalid API Key", "code": "invalid_api_key"}), 401
 
-    # 2. 解析Trae的请求参数
-    request_data = request.json
-    proxy_model_id = request_data.get("model")  # Trae传入的代理模型ID
-    messages = request_data.get("messages", [])  # Trae传入的对话内容
-
-    # 3. 检查模型ID是否存在于配置中
-    if proxy_model_id not in MODEL_CONFIGS:
-        return jsonify({"error": f"Model {proxy_model_id} not found"}), 404
-    model_config = MODEL_CONFIGS[proxy_model_id]
-
-    # 4. 构造发给NVIDIA的请求参数
-    nvidia_payload = {
-        "model": model_config["nvidia_model_id"],
-        "messages": messages,
-        "temperature": model_config["temperature"],
-        "top_p": model_config["top_p"],
-        "max_tokens": model_config["max_tokens"],
-        "stream": model_config["stream"]
-    }
-    # 添加模型特有参数（如frequency_penalty、extra_body）
-    if "frequency_penalty" in model_config:
-        nvidia_payload["frequency_penalty"] = model_config["frequency_penalty"]
-    if "presence_penalty" in model_config:
-        nvidia_payload["presence_penalty"] = model_config["presence_penalty"]
-    # 合并extra_body（如min_thinking_tokens、chat_template_kwargs）
-    if "extra_body" in model_config:
-        nvidia_payload.update(model_config["extra_body"])
-    # 添加模型要求的system prompt（如/think）
-    if "system_content" in model_config:
-        nvidia_payload["messages"].insert(0, {
-            "role": "system",
-            "content": model_config["system_content"]
-        })
-
-    # 5. 发送请求至NVIDIA API（流式响应）
-    nvidia_headers = {
-        "Authorization": f"Bearer {NVIDIA_API_KEY}",
-        "Content-Type": "application/json"
-    }
     try:
-        nvidia_response = requests.post(
-            url=f"{NVIDIA_BASE_URL}/chat/completions",
-            json=nvidia_payload,
-            headers=nvidia_headers,
-            stream=True,
-            timeout=300  # 大模型响应较慢，延长超时时间
-        )
-        nvidia_response.raise_for_status()  # 抛出HTTP错误（如401、404）
-    except Exception as e:
-        return jsonify({"error": f"NVIDIA API request failed: {str(e)}"}), 500
+        # 2. 解析Trae的请求参数
+        request_data = request.json
+        if not request_data:
+            return jsonify({"error": "Empty request body", "code": "invalid_request"}), 400
+            
+        proxy_model_id = request_data.get("model")
+        if not proxy_model_id:
+            return jsonify({"error": "Missing model parameter", "code": "invalid_request"}), 400
+            
+        messages = request_data.get("messages", [])
+        if not messages:
+            return jsonify({"error": "Empty messages array", "code": "invalid_request"}), 400
 
-    # 6. 处理流式响应，适配Trae格式（SSE协议，用\n\n分割消息）
-    response_id = generate_response_id()
-    # 正确解析HTTP日期头部以获得时间戳
-    date_header = nvidia_response.headers.get("date", "")
-    if date_header:
-        # HTTP日期格式: "Thu, 01 Jan 1970 00:00:00 GMT"
-        # 使用email.utils.parsedate_to_datetime来解析
-        from email.utils import parsedate_to_datetime
-        try:
-            created_time = int(parsedate_to_datetime(date_header).timestamp())
-        except Exception:
-            # 如果解析失败，使用当前时间
-            import time
-            created_time = int(time.time())
-    else:
-        # 如果没有日期头部，使用当前时间
-        import time
-        created_time = int(time.time())
+        # 3. 检查模型ID是否存在于配置中
+        if proxy_model_id not in MODEL_CONFIGS:
+            return jsonify({"error": f"Model {proxy_model_id} not found", "code": "model_not_found"}), 404
 
-    def stream_generator():
-        # 首条响应：必须包含role=assistant和空content（Trae要求）
-        first_chunk = {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": created_time,
-            "model": proxy_model_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": ""},
-                    "finish_reason": None
-                }
-            ]
+        # 4. 创建唯一响应ID，并将请求放入队列
+        response_id = generate_response_id()
+        
+        # 5. 构造请求数据并放入队列
+        queued_request = {
+            "response_id": response_id,
+            "proxy_model_id": proxy_model_id,
+            "messages": messages,
+            "timestamp": time.time()
         }
-        yield f"data: {json.dumps(first_chunk)}\n\n"
+        
+        try:
+            # 使用超时，避免无限等待
+            request_queue.put(queued_request, block=True, timeout=5)
+        except queue.Full:
+            return jsonify({"error": "Request queue is full, server is overloaded", "code": "server_overloaded"}), 503
 
-        # 中间响应：转发NVIDIA的流式内容（去掉role字段）
-        finish_reason = None
-        for line in nvidia_response.iter_lines(decode_unicode=True):
+        # 6. 返回流式响应
+        return Response(
+            stream_generator(response_id, proxy_model_id),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": f"Internal server error: {str(e)}", "code": "internal_error"}), 500
+
+def stream_generator(response_id: str, proxy_model_id: str) -> Generator[str, None, None]:
+    """
+    从指定响应队列中获取数据，并适配Trae格式生成流式响应。
+    """
+    # 检查服务是否正在关闭
+    if shutdown_event.is_set():
+        error_chunk = {"id": response_id, "choices": [{"delta": {"content": "\n\nError: Service is shutting down."}}]}
+        yield f"data: {json.dumps(error_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+        
+    created_time = int(uuid.uuid4().int / 1e6) # 模拟创建时间
+
+    # 首条响应
+    first_chunk = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created_time,
+        "model": proxy_model_id,
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
+    }
+    yield f"data: {json.dumps(first_chunk)}\n\n"
+
+    # 中间响应
+    finish_reason = None
+    start_time = time.time()
+    
+    # 线程安全地获取响应队列
+    with response_queues_lock:
+        response_queue = response_queues.get(response_id)
+    
+    if not response_queue:
+        # 队列可能还未创建，稍作等待
+        with response_events_lock:
+            if response_id in response_events:
+                response_events[response_id].wait(timeout=5)
+        
+        # 再次尝试获取队列（线程安全）
+        with response_queues_lock:
+            response_queue = response_queues.get(response_id)
+            
+        if not response_queue:
+            # 如果还未创建，说明请求处理失败
+            error_chunk = {"id": response_id, "choices": [{"delta": {"content": "\n\nError: Request processing failed to start."}}]}
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+    while not shutdown_event.is_set():
+        try:
+            # 使用超时获取，以便定期检查shutdown_event
+            try:
+                line = response_queue.get(timeout=0.5)
+            except queue.Empty:
+                # 检查总时间是否超过30秒（防止无限等待）
+                if time.time() - start_time > STREAM_MAX_TIMEOUT:
+                    error_chunk = {"id": response_id, "choices": [{"delta": {"content": "\n\nError: Maximum streaming time exceeded."}}]}
+                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                    finish_reason = "timeout"
+                    break
+                continue
+                
+            if line is None:
+                break
+            
+            if isinstance(line, dict) and "error" in line:
+                # 处理错误信息
+                error_content = line["error"]
+                error_chunk = {"id": response_id, "choices": [{"delta": {"content": f"\n\nError: {error_content}"}}]}
+                yield f"data: {json.dumps(error_chunk)}\n\n"
+                finish_reason = "error"
+                break
+
             if not line.startswith("data: "):
                 continue
-            nvidia_chunk = line[6:]  # 去掉"data: "前缀
-            if nvidia_chunk == "[DONE]":
+            
+            nvidia_chunk_str = line[6:]
+            if nvidia_chunk_str == "[DONE]":
                 finish_reason = "stop"
-                break
+                continue
+                
             try:
-                chunk_data = json.loads(nvidia_chunk)
-                # 适配Trae格式：移除delta中的role，保留content
+                chunk_data = json.loads(nvidia_chunk_str)
                 if "choices" in chunk_data and chunk_data["choices"]:
                     chunk_data["id"] = response_id
                     chunk_data["model"] = proxy_model_id
-                    chunk_data["choices"][0]["delta"].pop("role", None)  # Trae后续响应不需要role
+                    chunk_data["choices"][0]["delta"].pop("role", None)
                     yield f"data: {json.dumps(chunk_data)}\n\n"
             except json.JSONDecodeError:
                 continue
+        except Exception as e:
+            error_chunk = {"id": response_id, "choices": [{"delta": {"content": f"\n\nError: Stream processing error: {str(e)}"}}]}
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            finish_reason = "error"
+            break
 
-        # 末尾响应：必须包含空content、finish_reason=stop和usage（Trae要求）
-        final_chunk = {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": created_time,
-            "model": proxy_model_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"content": ""},
-                    "finish_reason": finish_reason or "stop"
-                }
-            ],
-            "usage": {  # 若NVIDIA返回usage可替换，此处默认填充0
-                "completion_tokens": 0,
-                "prompt_tokens": 0,
-                "total_tokens": 0,
-                "prompt_cache_hit_tokens": 0,
-                "prompt_cache_miss_tokens": 0,
-                "prompt_tokens_details": {"cached_tokens": 0}
-            }
-        }
-        yield f"data: {json.dumps(final_chunk)}\n\n"
-        # 发送结束标志
-        yield "data: [DONE]\n\n"
+    # 末尾响应
+    final_chunk = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created_time,
+        "model": proxy_model_id,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason or "stop"}],
+        "usage": {"completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0}
+    }
+    yield f"data: {json.dumps(final_chunk)}\n\n"
+    yield "data: [DONE]\n\n"
 
-    # 返回流式响应（SSE格式）
-    return Response(
-        stream_generator(),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
-        }
-    )
+    # 清理资源（线程安全）
+    with response_queues_lock:
+        if response_id in response_queues:
+            del response_queues[response_id]
+    with response_events_lock:
+        if response_id in response_events:
+            del response_events[response_id]
+
+
+def shutdown_threads():
+    """优雅地关闭线程池和请求处理线程"""
+    # 设置关闭事件，通知所有线程准备关闭
+    shutdown_event.set()
+    request_queue.put(None)  # 发送终止信号
+    # 等待线程池完成当前任务，最多等待SHUTDOWN_TIMEOUT秒
+    executor.shutdown(wait=True, timeout=SHUTDOWN_TIMEOUT)
+    # 清理所有剩余的响应队列和事件
+    with response_queues_lock:
+        response_queues.clear()
+    with response_events_lock:
+        response_events.clear()
 
 if __name__ == "__main__":
+    # 启动请求处理线程
+    processor_thread = threading.Thread(target=request_processor)
+    processor_thread.daemon = True
+    processor_thread.start()
+
+    # 注册退出时关闭线程的函数
+    atexit.register(shutdown_threads)
+
     print("=" * 60)
     print("Trae-NVIDIA 代理服务启动信息：")
     print(f"1. 代理地址：http://{PROXY_HOST}:{PROXY_PORT}")
