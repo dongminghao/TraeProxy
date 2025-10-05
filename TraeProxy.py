@@ -123,7 +123,7 @@ def get_env_int(name: str, default: int) -> int:
         value = os.environ.get(name)
         return int(value) if value is not None else default
     except (ValueError, TypeError):
-        logger.warning(f"无效的环境变量 {name}，使用默认值: {default}")
+        print(f"警告: 无效的环境变量 {name}，使用默认值: {default}")
         return default
 
 MAX_QUEUE_SIZE = get_env_int("TRAE_PROXY_MAX_QUEUE_SIZE", 100)  # 请求队列最大容量
@@ -258,36 +258,31 @@ def process_nvidia_request(request_data: Dict, response_queue: queue.Queue, done
                     break
                     
                 if line and line.startswith("data: "):
-                    # 实现流量控制：每处理10行数据，检查队列状态
-                    line_count += 1
-                    if line_count % 10 == 0:
-                        # 使用线程安全的方式检查队列状态，避免使用非线程安全的qsize()
-                        try:
-                            # 使用非阻塞方式尝试放入队列，如果失败说明队列可能已满
-                            test_item = "queue_test"
-                            response_queue.put(test_item, block=False)
-                            # 如果成功，立即移除测试项
-                            try:
-                                # 尝试获取刚放入的测试项
-                                response_queue.get_nowait()
-                            except queue.Empty:
-                                pass
-                        except queue.Full:
-                            # 如果队列已满，暂停处理让消费者处理队列中的数据
-                            time.sleep(0.1)
+                    # 使用有限重试放入队列，确保数据不丢失同时避免无限阻塞
+                    max_retries = 50  # 最大重试次数
+                    retry_count = 0
+                    put_success = False
                     
-                    # 使用非阻塞方式放入队列，避免阻塞
-                    try:
-                        response_queue.put(line, block=False)
-                    except queue.Full:
-                        # 如果队列已满，等待一小段时间后重试
-                        time.sleep(0.05)
+                    while not shutdown_event.is_set() and retry_count < max_retries:
                         try:
-                            response_queue.put(line, block=False)
+                            response_queue.put(line, block=True, timeout=2.0)  # 增加超时时间到2秒
+                            put_success = True
+                            break  # 成功放入，退出循环
                         except queue.Full:
-                            # 如果仍然失败，记录错误并继续
-                            # 在实际应用中，这里可以添加日志记录
-                            pass
+                            # 如果队列已满，短暂暂停后重试
+                            retry_count += 1
+                            time.sleep(0.2 * min(retry_count, 5))  # 递增等待时间，最多1.0秒
+                            continue  # 继续重试
+                    
+                    # 如果重试次数用完仍未成功，记录错误但继续处理
+                    if not put_success and not shutdown_event.is_set():
+                        # 在实际应用中，这里可以添加日志记录
+                        # 暂时跳过此数据点，避免阻塞整个流程
+                        pass
+                    
+                    # 如果关闭事件触发，退出循环
+                    if shutdown_event.is_set():
+                        break
             
             # 流结束后放入None作为标志
             response_queue.put(None)
@@ -332,6 +327,7 @@ def process_nvidia_request(request_data: Dict, response_queue: queue.Queue, done
             # 处理JSON解析错误
             response_queue.put({"error": f"JSON decode error: {str(e)}", "code": "json_decode_error"})
             response_queue.put(None)
+            done_event.set()  # 确保在异常路径设置事件
             break
             
         except Exception as e:
@@ -339,6 +335,7 @@ def process_nvidia_request(request_data: Dict, response_queue: queue.Queue, done
             error_info = f"NVIDIA API request failed for model {proxy_model_id}: {str(e)}"
             response_queue.put({"error": error_info, "code": "nvidia_api_error"})
             response_queue.put(None)
+            done_event.set()  # 确保在异常路径设置事件
             break
     
     # 确保事件被设置
@@ -510,7 +507,7 @@ def stream_generator(response_id: str, proxy_model_id: str) -> Generator[str, No
         with response_events_lock:
             if response_id in response_events:
                 # 使用可配置的模型等待时间
-                wait_timeout = get_model_timeout(proxy_model_id, 5) // 12  # 默认5秒，按比例调整
+                wait_timeout = max(get_model_timeout(proxy_model_id, 5) / 12, 1.0)  # 使用浮点除法，至少等待1秒
                 response_events[response_id].wait(timeout=wait_timeout)
         
         # 再次尝试获取队列（线程安全）
