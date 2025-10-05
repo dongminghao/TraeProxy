@@ -236,10 +236,10 @@ def process_nvidia_request(request_data: Dict, response_queue: queue.Queue, done
                         pass
                 
                 # 对可恢复错误进行重试，避免对客户端错误无条件重试
-                retryable_errors = {429, 500, 502, 503, 504}  # 可重试的HTTP状态码
-                if (nvidia_response.status_code in retryable_errors or 
+                retryable_errors = {429, 500, 502, 503, 504}  # 可重试的HTTP状态码   
+                if ((nvidia_response.status_code in retryable_errors or 
                     (nvidia_response.status_code == 400 and "deepseek" in proxy_model_id.lower() and "rate_limit" in error_message.lower())) and  # 仅对deepseek的速率限制错误重试
-                    retry_count < MAX_RETRY_COUNT - 1:
+                    retry_count < MAX_RETRY_COUNT - 1):
                     retry_count += 1
                     # 使用指数退避
                     backoff_time = min(2 ** retry_count, 10)  # 指数退避，最大10秒
